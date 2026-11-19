@@ -1,0 +1,339 @@
+// Sports Equipment ERP / MES - initial manufacturing data model
+// Target stack: PostgreSQL + Prisma ORM 7.x
+// Note: inventory and workflow invariants must also be enforced at the service/DB layer.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ItemType {
+  RAW_MATERIAL
+  COMPONENT
+  SEMI_FINISHED
+  FINISHED_GOOD
+  CONSUMABLE
+}
+
+enum BomStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum ProductionOrderStatus {
+  DRAFT
+  RELEASED
+  IN_PROGRESS
+  COMPLETED
+  CLOSED
+  CANCELLED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  APPROVED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum SalesOrderStatus {
+  DRAFT
+  CONFIRMED
+  PARTIALLY_SHIPPED
+  SHIPPED
+  CANCELLED
+}
+
+enum InventoryMovementType {
+  PURCHASE_RECEIPT
+  PRODUCTION_ISSUE
+  PRODUCTION_RETURN
+  PRODUCTION_RECEIPT
+  SALES_SHIPMENT
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+}
+
+enum UserRole {
+  ADMIN
+  PLANNER
+  PROCUREMENT
+  WAREHOUSE
+  PRODUCTION
+  SALES
+  VIEWER
+}
+
+// Master data: raw materials, parts, semi-finished products and finished equipment.
+model Item {
+  id                         String                    @id @default(cuid())
+  sku                        String                    @unique @db.VarChar(80)
+  name                       String                    @db.VarChar(200)
+  type                       ItemType
+  baseUnit                   String                    @db.VarChar(20) // pcs, kg, m, etc.
+  trackLot                   Boolean                   @default(false)
+  reorderPoint               Decimal                   @default(0) @db.Decimal(18, 4)
+  isActive                   Boolean                   @default(true)
+  createdAt                  DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt                  DateTime                  @updatedAt @db.Timestamptz(6)
+
+  productBoms                Bom[]                     @relation("BomFinishedItem")
+  componentBomLines          BomLine[]
+  productionOrders           ProductionOrder[]        @relation("ProductionFinishedItem")
+  productionOrderMaterials   ProductionOrderMaterial[]
+  inventoryBalances          InventoryBalance[]
+  inventoryTransactions      InventoryTransaction[]
+  purchaseOrderLines         PurchaseOrderLine[]
+  salesOrderLines            SalesOrderLine[]
+
+  @@index([type, isActive])
+  @@map("items")
+}
+
+model Warehouse {
+  id                    String                 @id @default(cuid())
+  code                  String                 @unique @db.VarChar(40)
+  name                  String                 @db.VarChar(120)
+  isActive              Boolean                @default(true)
+  createdAt             DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime               @updatedAt @db.Timestamptz(6)
+
+  inventoryBalances     InventoryBalance[]
+  inventoryTransactions InventoryTransaction[]
+
+  @@map("warehouses")
+}
+
+// Versioned BOM; a production order stores its material snapshot at release time.
+model Bom {
+  id                String           @id @default(cuid())
+  productItemId     String
+  version           Int
+  status            BomStatus        @default(DRAFT)
+  description       String?          @db.VarChar(250)
+  effectiveFrom     DateTime?        @db.Timestamptz(6)
+  createdAt         DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime         @updatedAt @db.Timestamptz(6)
+
+  productItem       Item             @relation("BomFinishedItem", fields: [productItemId], references: [id])
+  lines             BomLine[]
+  productionOrders  ProductionOrder[]
+
+  @@unique([productItemId, version])
+  @@index([productItemId, status])
+  @@map("boms")
+}
+
+model BomLine {
+  id                String   @id @default(cuid())
+  bomId             String
+  componentItemId   String
+  quantityPerUnit   Decimal  @db.Decimal(18, 4)
+  scrapRate         Decimal  @default(0) @db.Decimal(8, 6) // 0.02 = 2% allowance
+  createdAt         DateTime @default(now()) @db.Timestamptz(6)
+
+  bom               Bom      @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  componentItem     Item     @relation(fields: [componentItemId], references: [id])
+
+  @@unique([bomId, componentItemId])
+  @@index([componentItemId])
+  @@map("bom_lines")
+}
+
+model ProductionOrder {
+  id                    String                    @id @default(cuid())
+  orderNumber           String                    @unique @db.VarChar(60)
+  finishedItemId        String
+  bomId                 String
+  plannedQuantity       Decimal                   @db.Decimal(18, 4)
+  completedQuantity     Decimal                   @default(0) @db.Decimal(18, 4)
+  status                ProductionOrderStatus     @default(DRAFT)
+  plannedStartAt        DateTime?                 @db.Timestamptz(6)
+  plannedEndAt          DateTime?                 @db.Timestamptz(6)
+  releasedAt            DateTime?                 @db.Timestamptz(6)
+  completedAt           DateTime?                 @db.Timestamptz(6)
+  note                  String?
+  createdAt             DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime                  @updatedAt @db.Timestamptz(6)
+
+  finishedItem          Item                      @relation("ProductionFinishedItem", fields: [finishedItemId], references: [id])
+  bom                   Bom                       @relation(fields: [bomId], references: [id])
+  materials             ProductionOrderMaterial[]
+  inventoryTransactions InventoryTransaction[]
+
+  @@index([status, plannedStartAt])
+  @@index([finishedItemId])
+  @@map("production_orders")
+}
+
+// Snapshot fields are copied from the BOM when a work order is released.
+// Actual issues and returns are recorded in inventory_transactions.
+model ProductionOrderMaterial {
+  id                    String                 @id @default(cuid())
+  productionOrderId     String
+  componentItemId       String
+  bomQuantitySnapshot   Decimal                @db.Decimal(18, 4)
+  scrapRateSnapshot     Decimal                @default(0) @db.Decimal(8, 6)
+  requiredQuantity      Decimal                @db.Decimal(18, 4)
+  createdAt             DateTime               @default(now()) @db.Timestamptz(6)
+
+  productionOrder       ProductionOrder        @relation(fields: [productionOrderId], references: [id], onDelete: Restrict)
+  componentItem         Item                   @relation(fields: [componentItemId], references: [id])
+  inventoryTransactions InventoryTransaction[]
+
+  @@unique([productionOrderId, componentItemId])
+  @@index([componentItemId])
+  @@map("production_order_materials")
+}
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  orderNumber  String              @unique @db.VarChar(60)
+  supplierName String              @db.VarChar(200)
+  status       PurchaseOrderStatus @default(DRAFT)
+  orderedAt    DateTime            @default(now()) @db.Timestamptz(6)
+  expectedAt   DateTime?           @db.Timestamptz(6)
+  createdAt    DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime            @updatedAt @db.Timestamptz(6)
+
+  lines        PurchaseOrderLine[]
+
+  @@index([status, orderedAt])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id                    String                 @id @default(cuid())
+  purchaseOrderId       String
+  itemId                String
+  orderedQuantity       Decimal                @db.Decimal(18, 4)
+  unitPrice             Decimal?               @db.Decimal(18, 4)
+  createdAt             DateTime               @default(now()) @db.Timestamptz(6)
+
+  purchaseOrder         PurchaseOrder          @relation(fields: [purchaseOrderId], references: [id])
+  item                  Item                   @relation(fields: [itemId], references: [id])
+  inventoryTransactions InventoryTransaction[]
+
+  @@index([purchaseOrderId, itemId])
+  @@map("purchase_order_lines")
+}
+
+model SalesOrder {
+  id          String           @id @default(cuid())
+  orderNumber String           @unique @db.VarChar(60)
+  customerName String          @db.VarChar(200)
+  status      SalesOrderStatus @default(DRAFT)
+  orderedAt   DateTime         @default(now()) @db.Timestamptz(6)
+  createdAt   DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime         @updatedAt @db.Timestamptz(6)
+
+  lines       SalesOrderLine[]
+
+  @@index([status, orderedAt])
+  @@map("sales_orders")
+}
+
+model SalesOrderLine {
+  id                    String                 @id @default(cuid())
+  salesOrderId          String
+  itemId                String
+  orderedQuantity       Decimal                @db.Decimal(18, 4)
+  unitPrice             Decimal?               @db.Decimal(18, 4)
+  createdAt             DateTime               @default(now()) @db.Timestamptz(6)
+
+  salesOrder            SalesOrder             @relation(fields: [salesOrderId], references: [id])
+  item                  Item                   @relation(fields: [itemId], references: [id])
+  inventoryTransactions InventoryTransaction[]
+
+  @@index([salesOrderId, itemId])
+  @@map("sales_order_lines")
+}
+
+// Authoritative append-only inventory ledger. Negative quantityDelta = stock out.
+// The posting service must atomically insert a row and update InventoryBalance.
+model InventoryTransaction {
+  id                       String                   @id @default(cuid())
+  idempotencyKey           String                   @unique @db.VarChar(120)
+  movementType             InventoryMovementType
+  warehouseId              String
+  itemId                   String
+  lotCode                  String                   @default("NO_LOT") @db.VarChar(80)
+  quantityDelta            Decimal                  @db.Decimal(18, 4)
+  unitCost                 Decimal?                 @db.Decimal(18, 4)
+  productionOrderId        String?
+  productionOrderMaterialId String?
+  purchaseOrderLineId      String?
+  salesOrderLineId         String?
+  performedById            String?
+  note                     String?
+  createdAt                DateTime                 @default(now()) @db.Timestamptz(6)
+
+  warehouse                Warehouse                @relation(fields: [warehouseId], references: [id])
+  item                     Item                     @relation(fields: [itemId], references: [id])
+  productionOrder          ProductionOrder?         @relation(fields: [productionOrderId], references: [id])
+  productionOrderMaterial  ProductionOrderMaterial? @relation(fields: [productionOrderMaterialId], references: [id])
+  purchaseOrderLine        PurchaseOrderLine?       @relation(fields: [purchaseOrderLineId], references: [id])
+  salesOrderLine           SalesOrderLine?          @relation(fields: [salesOrderLineId], references: [id])
+  performedBy              User?                    @relation(fields: [performedById], references: [id])
+
+  @@index([warehouseId, itemId, lotCode, createdAt])
+  @@index([movementType, createdAt])
+  @@index([productionOrderId])
+  @@map("inventory_transactions")
+}
+
+// Derived balance; NO_LOT is a sentinel to avoid duplicate NULL unique keys.
+model InventoryBalance {
+  id              String    @id @default(cuid())
+  warehouseId     String
+  itemId          String
+  lotCode         String    @default("NO_LOT") @db.VarChar(80)
+  quantityOnHand  Decimal   @default(0) @db.Decimal(18, 4)
+  version         Int       @default(0) // optional optimistic-concurrency token
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+
+  warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
+  item            Item      @relation(fields: [itemId], references: [id])
+
+  @@unique([warehouseId, itemId, lotCode])
+  @@index([itemId])
+  @@map("inventory_balances")
+}
+
+model User {
+  id                    String                 @id @default(cuid())
+  email                 String                 @unique @db.VarChar(250)
+  displayName           String                 @db.VarChar(120)
+  role                  UserRole               @default(VIEWER)
+  isActive              Boolean                @default(true)
+  createdAt             DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime               @updatedAt @db.Timestamptz(6)
+
+  inventoryTransactions InventoryTransaction[]
+  auditLogs             AuditLog[]
+
+  @@map("users")
+}
+
+model AuditLog {
+  id          String    @id @default(cuid())
+  actorId     String?
+  action      String    @db.VarChar(80)
+  entityType  String    @db.VarChar(80)
+  entityId    String    @db.VarChar(80)
+  before      Json?
+  after       Json?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+
+  actor       User?     @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("audit_logs")
+}
