@@ -1,0 +1,21 @@
+{
+  "name": "sports-equipment-erp-starter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Small sports equipment manufacturing ERP / MES data model starter",
+  "scripts": {
+    "db:validate": "prisma validate",
+    "db:format": "prisma format",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.10.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.0.0",
+    "prisma": "^7.10.0",
+    "typescript": "^5.9.0"
+  }
+}
